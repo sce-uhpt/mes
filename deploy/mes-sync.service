@@ -1,0 +1,18 @@
+# systemd-Unit fuer den Poller. Installation siehe README, Abschnitt "VM".
+# UV_BIN wird bei der Installation per sed durch den Pfad von `which uv` ersetzt.
+[Unit]
+Description=mes-sync: Proxia -> sce_mes (Stapler-Leitsystem / Milk Run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sceuser
+WorkingDirectory=/opt/sce/mes
+ExecStart=UV_BIN run --frozen python -m mes_sync
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
