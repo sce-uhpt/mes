@@ -1,11 +1,14 @@
-# mes — Proxia → SCE (Stapler-Leitsystem / Milk Run)
+# mes — Proxia → SCE (Stapler-Leitsystem / Milk Run + Bestandsmonitor)
 
 Poller, der alle 30 s Rückmeldungen aus dem MES **Proxia** liest, daraus
 **Transportaufträge** ableitet und in das SCE-Warehouse (Schema `sce_mes`)
-schreibt. Die Shiny-App `app_transport` (Repo `shiny`) liest nur `sce_mes`.
+schreibt. Alle 2 min führt er außerdem den **Bestand an Ware in Arbeit** fort
+(Journal `wip_bewegung`). Die Shiny-Apps `app_transport` und `app_bestand`
+(Repo `shiny`) lesen nur `sce_mes`.
 
 ```
 Proxia (User report, nur lesen) ──► mes_sync (VM, systemd) ──► SCE.sce_mes ◄── app_transport (/transport/)
+                                                                           ◄── app_bestand   (/bestand/)
 ```
 
 ## Datenquellen in Proxia
@@ -40,6 +43,33 @@ damit der Poller nie Buchungen an den Terminals blockiert.
 Alles in einer Transaktion je Lauf; Rückmeldungen werden erst nach den Transporten
 als „gesehen“ gespeichert, dadurch geht bei Fehlern nichts verloren.
 
+## Bestandsmonitor (Ware in Arbeit)
+
+Logik in `bestand.py` (rein, getestet), Ablauf in `bestand_lauf.py`.
+
+- **Puffer** = Übergang Vorgang A → Nachfolger B. Bestand = Gut(A) − Gut(B) − Ausschuss(B).
+- **Ort**: `bereit` (bei A) → `unterwegs` (Fahrer hat übernommen) → `an_b` (erledigt bzw. kein
+  Transport nötig). `auto_erledigt` zählt wie erledigt. B verbraucht zuerst aus `an_b`.
+- **Mengen**: TSF_RUECKMELDUNG hat keine Menge. Gutmengen je Tag/Schicht aus `TSF_WT_QTY`
+  (nur `C_GUT`), Summen und Ausschuss aus `TSF_WT`. Rund 40 % der Vorgänge werden außerhalb
+  von Proxia (vermutlich SAP) fertig gemeldet — dann erkennt der Poller die Änderung in TSF_WT
+  und nimmt den Erkennungszeitpunkt (`zeit_quelle = erkennung`).
+- **Erster Lauf** (`bestand_status.backfill_ab` leer): Aufträge mit Proxia-Aktivität in den
+  letzten `MES_BESTAND_TAGE` Tagen plus offene Aufträge mit Aktivität in `MES_BESTAND_SCOPE_TAGE`
+  nachladen. Was vor dem Fenster passiert ist, wird zum Anfangsbestand (`init`).
+- **Jeder Lauf** gleicht danach je Puffer Soll (TSF_WT) gegen Journal ab (`abgleich`) — fängt
+  geänderte Arbeitspläne, gelöschte Vorgänge und Korrekturen ab. Normalfall: 0 Korrekturen.
+- **Abschluss**: Ist der letzte Vorgang fertig, wird der Restbestand ausgebucht.
+- **Fehlbuchungen** (z. B. 2³¹): Menge > max(10 × Soll, Soll + 1000) wird ignoriert und in
+  `bestand_vorgang.plausi` vermerkt.
+- **Arbeitsplatz-Art** `arbeitsplatz.art`: `intern` | `extern` (C_DELIVERER) | `pseudo`
+  (`MES_PSEUDO_ARBEITSPLAETZE`, Standard BETRIEB/VERSAND) | `fremd_standort` (Name beginnt mit
+  `DO_`). Der Poller setzt nur einen Vorschlag, solange die Spalte leer ist — pflegbar per SQL.
+
+```
+uv run python -m mes_sync bestand-reset   # Journal leeren, nächster Lauf lädt komplett neu
+```
+
 ## Tabellen (`sce_mes`)
 
 | Tabelle | Inhalt |
@@ -51,6 +81,11 @@ als „gesehen“ gespeichert, dadurch geht bei Fehlern nichts verloren.
 | `arbeitsplatz` | Stammdaten — `sektor`, `transport_modus`, `lagerort_code` werden **gepflegt**, der Poller legt nur neue Zeilen an |
 | `fahrer` | Auswahlliste der App |
 | `poller_status` | Heartbeat + Wasserzeichen |
+| `bestand_vorgang` | Vorgänge der Aufträge im Bestand (wirksame Gutmenge, Kette, Plausi) |
+| `wip_bewegung` | Journal: jede Mengenänderung je Puffer und Ort, `quelle_key` UNIQUE |
+| `bestand_puffer` | aktueller Stand je Puffer (bereit/unterwegs/an_b, liegt seit) |
+| `bestand_tag` | Verlauf: Puffer und Menge je Arbeitsplatz B am Tagesende |
+| `bestand_status` | Heartbeat + Wasserzeichen des Bestand-Laufs |
 
 Alle Zeitstempel UTC. Definition: `src/mes_sync/schema.py` (DDL zum Nachlesen: `sql/001_sce_mes.sql`).
 
@@ -63,7 +98,7 @@ uv run python -m mes_sync --once                  # ein Durchlauf mit Statistik
 uv run python -m mes_sync                         # Dauerschleife (systemd)
 uv run python -m mes_sync export-arbeitsplaetze   # Excel zur Sektorpflege -> output/
 uv run python -m mes_sync ddl                     # sql/001_sce_mes.sql neu erzeugen
-uv run pytest                                     # Tests (inkl. End-to-End mit simuliertem Proxia)
+uv run python -m pytest                           # Tests (inkl. End-to-End mit simuliertem Proxia)
 ```
 
 ### Offline-Demo ohne Proxia (simuliert, SQLite)
@@ -103,4 +138,6 @@ WHERE status IN ('offen','uebernommen') AND rueck_ts < DATEADD(HOUR, -4, SYSUTCD
 - Entscheidung Teil-/Vollmengen je Arbeitsplatz
 - Login (Fahrer wählt sich aus; `?fahrer=Name` in der URL für Tablets)
 - Scan / Lagerortbuchung (Basis: `transport_event` + `arbeitsplatz.lagerort_code`)
+- Bestand: Aufträge ohne jede Proxia-Aktivität im Scope-Zeitraum fehlen; rückwirkend genaue
+  Zeitpunkte für Meldungen außerhalb Proxia nur mit SAP-Rückmeldungen (AFRU)
 - Auto-Erledigung ist eine Heuristik — bei Teillosen kann ein `C_START` am Folgevorgang zu einem früheren Los gehören

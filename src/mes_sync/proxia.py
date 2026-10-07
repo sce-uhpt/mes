@@ -69,6 +69,130 @@ def _clean(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
     return df
 
 
+# ── Bestandsmonitor ──────────────────────────────────────────────────────────
+# Mengen: TSF_RUECKMELDUNG hat KEINE Menge. Gutmengen je Tag/Schicht stehen in
+# TSF_WT_QTY (nur Klasse C_GUT, kein Zeitstempel), Summen in TSF_WT.
+# Ausschuss/Nacharbeit gibt es nur als Summe in TSF_WT (QTY_CONFIRMED_AUS/_NACH).
+# Rund 40 % der Vorgaenge werden ausserhalb von Proxia (vermutlich SAP) fertig
+# gemeldet: dann aendert sich nur TSF_WT, ohne Rueckmeldung (PROXIA_DB.md Abschn. 10).
+
+SQL_SCOPE_ORDERS = text("""
+    SELECT DISTINCT WT.PPS_ORDER
+    FROM dbo.TSF_RUECKMELDUNG AS RM
+    JOIN dbo.TSF_WT AS WT ON WT.WT_ID = RM.WT_ID
+    WHERE RM.RUECK_TS >= :seit
+    UNION
+    SELECT DISTINCT WT.PPS_ORDER
+    FROM dbo.TSF_WT_QTY AS Q
+    JOIN dbo.TSF_WT AS WT ON WT.WT_ID = Q.WT_ID
+    WHERE Q.CAL_DAY >= :seit_tag
+""")
+
+# Offene Auftraege mit Gutmenge, die seit `seit` ueberhaupt eine Proxia-Aktivitaet hatten:
+# Ware, die schon laenger als das Nachladefenster liegt, soll trotzdem sichtbar sein.
+SQL_OFFENE_ORDERS = text("""
+    SELECT DISTINCT WT.PPS_ORDER
+    FROM dbo.TSF_WT AS WT
+    WHERE WT.WT_DELETED = 0 AND WT.WT_STATUS_ID <> 'C_FRTG'
+      AND EXISTS (SELECT 1 FROM dbo.TSF_WT AS G
+                  WHERE G.PPS_ORDER = WT.PPS_ORDER AND G.WT_DELETED = 0 AND G.QTY_CONFIRMED_GUT > 0)
+      AND EXISTS (SELECT 1 FROM dbo.TSF_RUECKMELDUNG AS RM
+                  JOIN dbo.TSF_WT AS W2 ON W2.WT_ID = RM.WT_ID
+                  WHERE W2.PPS_ORDER = WT.PPS_ORDER AND RM.RUECK_TS >= :seit)
+""")
+
+SQL_BESTAND_VORGAENGE = text("""
+    SELECT WT.WT_ID, WT.PPS_ORDER, WT.AFO_NR, WT.DISPLAYNAME AS VORGANG_TEXT,
+           WT.WT_STATUS_ID, WT.PPS_WORK_CNTR, WT.PLANNED_RES_ID,
+           R.DISPLAYNAME AS PLAN_RES, R.RES_TYPE_ID AS PLAN_RES_TYP,
+           WT.QTY_SOLL, WT.QTY_CONFIRMED_GUT, WT.QTY_CONFIRMED_AUS, WT.QTY_CONFIRMED_NACH,
+           WT.UNIT_QTY, WT.CONF_NR, WT.BEGIN_SCHEDULED,
+           WT.PPS_ART_NR, WT.PPS_ART_DISPLAYNAME, PSP.PSP_ELEMENT_NR
+    FROM dbo.TSF_WT AS WT
+    LEFT JOIN dbo.TRS_RES AS R ON R.RES_ID = WT.PLANNED_RES_ID
+    LEFT JOIN dbo.TSF_FA AS FA ON FA.FA_ID = WT.FA_ID
+    LEFT JOIN dbo.TSF_PSP_ELEMENT AS PSP ON PSP.PSP_ELEMENT_ID = FA.PSP_ELEMENT_ID
+    WHERE WT.WT_DELETED = 0 AND WT.PPS_ORDER IN :orders
+""").bindparams(bindparam("orders", expanding=True))
+
+SQL_WT_QTY = text("""
+    SELECT Q.WT_ID, Q.CAL_DAY, Q.SHIFT_ID, SUM(Q.QTY) AS QTY
+    FROM dbo.TSF_WT_QTY AS Q
+    JOIN dbo.TSF_WT AS WT ON WT.WT_ID = Q.WT_ID
+    WHERE Q.QTY_CLASS_ID = 'C_GUT' AND WT.PPS_ORDER IN :orders
+    GROUP BY Q.WT_ID, Q.CAL_DAY, Q.SHIFT_ID
+""").bindparams(bindparam("orders", expanding=True))
+
+SQL_RUECK_ORDERS = text("""
+    SELECT RM.RUECK_ID, RM.WT_ID, RM.RUECK_TS, RM.RUECK_TYPE_ID
+    FROM dbo.TSF_RUECKMELDUNG AS RM
+    JOIN dbo.TSF_WT AS WT ON WT.WT_ID = RM.WT_ID
+    WHERE WT.PPS_ORDER IN :orders
+""").bindparams(bindparam("orders", expanding=True))
+
+BESTAND_VORGANG_COLS = {
+    **{k: v for k, v in VORGANG_COLS.items() if k not in ("PPS_PLANT",)},
+    "QTY_CONFIRMED_AUS": "qty_aus", "QTY_CONFIRMED_NACH": "qty_nach",
+    "UNIT_QTY": "einheit", "CONF_NR": "conf_nr", "BEGIN_SCHEDULED": "begin_scheduled",
+}
+
+
+def _chunked_read(engine: Engine, sql, orders) -> pd.DataFrame:
+    orders = sorted({str(o).strip() for o in orders if pd.notna(o) and str(o).strip()})
+    frames = []
+    with engine.connect() as con:
+        for i in range(0, len(orders), ORDER_CHUNK):
+            frames.append(pd.read_sql(sql, con, params={"orders": orders[i:i + ORDER_CHUNK]}))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def fetch_scope_orders(engine: Engine, seit) -> set:
+    """Auftraege mit Proxia-Aktivitaet (Rueckmeldung oder Mengenbuchung) seit `seit` (UTC)."""
+    with engine.connect() as con:
+        df = pd.read_sql(SQL_SCOPE_ORDERS, con,
+                         params={"seit": seit, "seit_tag": pd.Timestamp(seit).normalize().to_pydatetime()})
+    return {str(o).strip() for o in df.iloc[:, 0].dropna()}
+
+
+def fetch_offene_orders(engine: Engine, seit) -> set:
+    with engine.connect() as con:
+        df = pd.read_sql(SQL_OFFENE_ORDERS, con, params={"seit": seit})
+    return {str(o).strip() for o in df.iloc[:, 0].dropna()}
+
+
+def fetch_bestand_vorgaenge(engine: Engine, orders) -> pd.DataFrame:
+    df = _chunked_read(engine, SQL_BESTAND_VORGAENGE, orders)
+    if df.empty:
+        return pd.DataFrame(columns=list(BESTAND_VORGANG_COLS.values()))
+    df = _clean(df, BESTAND_VORGANG_COLS)
+    for col in ("qty_soll", "qty_gut", "qty_aus", "qty_nach"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ("einheit", "conf_nr"):
+        df[col] = df[col].astype("string").str.strip()
+    df["begin_scheduled"] = pd.to_datetime(df["begin_scheduled"], errors="coerce")
+    return df.drop_duplicates("wt_id")
+
+
+def fetch_wt_qty(engine: Engine, orders) -> pd.DataFrame:
+    df = _chunked_read(engine, SQL_WT_QTY, orders)
+    if df.empty:
+        return pd.DataFrame(columns=["wt_id", "cal_day", "shift_id", "qty"])
+    df = df.rename(columns={"WT_ID": "wt_id", "CAL_DAY": "cal_day", "SHIFT_ID": "shift_id", "QTY": "qty"})
+    df["wt_id"] = df["wt_id"].astype("string").str.strip()
+    df["cal_day"] = pd.to_datetime(df["cal_day"]).dt.normalize()
+    df["qty"] = pd.to_numeric(df["qty"], errors="coerce")
+    return df
+
+
+def fetch_rueck_orders(engine: Engine, orders) -> pd.DataFrame:
+    df = _chunked_read(engine, SQL_RUECK_ORDERS, orders)
+    if df.empty:
+        return pd.DataFrame(columns=["rueck_id", "wt_id", "rueck_ts", "rueck_type_id"])
+    df = _clean(df, EVENT_COLS)
+    df["rueck_ts"] = pd.to_datetime(df["rueck_ts"])
+    return df
+
+
 def fetch_events(engine: Engine, seit) -> pd.DataFrame:
     """Alle Rueckmeldungen seit `seit` (naive UTC-Zeit)."""
     with engine.connect() as con:

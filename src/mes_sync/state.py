@@ -9,11 +9,13 @@ import socket
 from datetime import datetime, timezone
 
 import pandas as pd
-from sqlalchemy import and_, func, insert, select, update
+from sqlalchemy import and_, func, insert, inspect, select, update
 from sqlalchemy.engine import Connection, Engine
 
 from .schema import (
+    SCHEMA,
     arbeitsplatz,
+    bestand_status,
     fahrer,
     metadata,
     poller_status,
@@ -67,14 +69,39 @@ def init_db(engine: Engine) -> None:
             con.exec_driver_sql(
                 "IF SCHEMA_ID('sce_mes') IS NULL EXEC('CREATE SCHEMA sce_mes')")
     metadata.create_all(engine, checkfirst=True)
+    _ergaenze_spalten(engine)
     with engine.begin() as con:
         if con.execute(select(func.count()).select_from(poller_status)).scalar() == 0:
             con.execute(insert(poller_status).values(id=1))
+        if con.execute(select(func.count()).select_from(bestand_status)).scalar() == 0:
+            con.execute(insert(bestand_status).values(id=1))
         if con.execute(select(func.count()).select_from(fahrer)).scalar() == 0:
             con.execute(insert(fahrer), [
                 {"name": "Fahrer 1", "aktiv": True},
                 {"name": "Fahrer 2", "aktiv": True},
             ])
+
+
+def _ergaenze_spalten(engine: Engine) -> None:
+    """Spalten, die nach dem ersten init-db dazugekommen sind, per ALTER TABLE nachziehen.
+
+    create_all legt nur fehlende Tabellen an, keine fehlenden Spalten.
+    """
+    insp = inspect(engine)
+    for table in metadata.sorted_tables:
+        if not insp.has_table(table.name, schema=SCHEMA):
+            continue
+        vorhanden = {c["name"].lower() for c in insp.get_columns(table.name, schema=SCHEMA)}
+        for col in table.columns:
+            if col.name.lower() in vorhanden:
+                continue
+            typ = col.type.compile(dialect=engine.dialect)
+            with engine.begin() as con:
+                con.exec_driver_sql(f"ALTER TABLE {SCHEMA}.{table.name} ADD {col.name} {typ} NULL")
+        vorhandene_idx = {i["name"].lower() for i in insp.get_indexes(table.name, schema=SCHEMA) if i.get("name")}
+        for idx in table.indexes:
+            if idx.name and idx.name.lower() not in vorhandene_idx:
+                idx.create(bind=engine)
 
 
 # ── Lesen ────────────────────────────────────────────────────────────────────

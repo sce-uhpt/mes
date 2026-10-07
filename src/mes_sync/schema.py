@@ -10,6 +10,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Column,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -47,6 +48,7 @@ pps_rueckmeldung = Table(
     Column("geladen_am", TS, nullable=False),
     Index("ix_rueck_wt_ts", "wt_id", "rueck_ts"),
     Index("ix_rueck_ts", "rueck_ts"),
+    Index("ix_rueck_geladen", "geladen_am"),
 )
 
 pps_vorgang = Table(
@@ -84,6 +86,9 @@ arbeitsplatz = Table(
     Column("transport_modus", String(10)),
     Column("lagerort_code", Unicode(50)),
     Column("aktualisiert_am", TS, nullable=False),
+    # Art fuer den Bestandsmonitor: intern | extern | pseudo | fremd_standort.
+    # Der Poller setzt nur einen Vorschlag, solange die Spalte leer ist (siehe bestand.py).
+    Column("art", String(20)),
     CheckConstraint(
         "transport_modus IS NULL OR transport_modus IN ('teil','voll')",
         name="ck_arbeitsplatz_modus",
@@ -155,6 +160,109 @@ transport_event = Table(
     Column("info", Unicode(400)),
     Index("ix_event_transport", "transport_id"),
     Index("ix_event_ts", "ts"),
+)
+
+# ── Bestandsmonitor (Ware in Arbeit) ─────────────────────────────────────────
+# Puffer = Uebergang von Vorgang A (von_wt_id) zum Nachfolger B. Sein Bestand ist
+# Gutmenge(A) minus Verbrauch(B) = Gut + Ausschuss an B. Transporte verteilen ihn
+# auf die Orte bereit (bei A) / unterwegs / an_b.
+
+bestand_vorgang = Table(
+    "bestand_vorgang",
+    metadata,
+    Column("wt_id", String(40), primary_key=True),
+    Column("pps_order", String(20), nullable=False),
+    Column("afo_nr", String(10), nullable=False),
+    Column("vorgang_text", Unicode(400)),
+    Column("wt_status_id", String(20)),
+    Column("work_cntr", String(20)),
+    Column("plan_res", Unicode(200)),
+    Column("plan_res_typ", String(20)),
+    Column("vor_wt_id", String(40)),
+    Column("nach_wt_id", String(40)),
+    Column("qty_soll", Float),
+    Column("qty_gut", Float),        # wirksame Gutmenge (Fehlbuchungen herausgerechnet)
+    Column("qty_gut_proxia", Float), # Rohwert QTY_CONFIRMED_GUT
+    Column("qty_aus", Float),
+    Column("qty_nach", Float),
+    Column("einheit", String(20)),
+    Column("conf_nr", String(20)),
+    Column("begin_scheduled", TS),
+    Column("material_nr", Unicode(40)),
+    Column("material_text", Unicode(400)),
+    Column("psp", Unicode(40)),
+    Column("erste_meldung_ts", TS),   # erste Proxia-Rueckmeldung (egal welcher Typ)
+    Column("letzte_meldung_ts", TS),  # letzte Teil-/Fertigmeldung
+    Column("plausi", Unicode(200)),
+    Column("abgeschlossen", Boolean, nullable=False, default=False),
+    Column("aktualisiert_am", TS, nullable=False),
+    Index("ix_bvorgang_order", "pps_order"),
+    Index("ix_bvorgang_wc", "work_cntr"),
+)
+
+wip_bewegung = Table(
+    "wip_bewegung",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("quelle_key", String(100), nullable=False, unique=True),
+    Column("ts", TS, nullable=False),  # UTC, fachlicher Zeitpunkt
+    Column("pps_order", String(20), nullable=False),
+    Column("von_wt_id", String(40), nullable=False),
+    Column("nach_wt_id", String(40)),
+    Column("von_work_cntr", String(20)),
+    Column("nach_work_cntr", String(20)),
+    Column("ort", String(12), nullable=False),
+    Column("menge", Float, nullable=False),
+    Column("art", String(20), nullable=False),
+    Column("zeit_quelle", String(20), nullable=False),
+    Column("transport_id", Integer),
+    Column("info", Unicode(400)),
+    Column("erfasst_am", TS, nullable=False),
+    CheckConstraint("ort IN ('bereit','unterwegs','an_b')", name="ck_wip_ort"),
+    Index("ix_wip_von", "von_wt_id"),
+    Index("ix_wip_ts", "ts"),
+    Index("ix_wip_order", "pps_order"),
+    Index("ix_wip_transport", "transport_id"),
+)
+
+bestand_puffer = Table(
+    "bestand_puffer",
+    metadata,
+    Column("von_wt_id", String(40), primary_key=True),
+    Column("pps_order", String(20), nullable=False),
+    Column("nach_wt_id", String(40)),
+    Column("menge_bereit", Float, nullable=False, default=0),
+    Column("menge_unterwegs", Float, nullable=False, default=0),
+    Column("menge_an_b", Float, nullable=False, default=0),
+    Column("menge_gesamt", Float, nullable=False, default=0),
+    Column("liegt_seit", TS),
+    Column("letzte_bewegung", TS),
+    Column("zeit_geschaetzt", Boolean, nullable=False, default=False),
+    Column("aktualisiert_am", TS, nullable=False),
+    Index("ix_puffer_order", "pps_order"),
+    Index("ix_puffer_nach", "nach_wt_id"),
+)
+
+bestand_tag = Table(
+    "bestand_tag",
+    metadata,
+    Column("tag", Date, primary_key=True),          # Kalendertag Europe/Berlin, Stand Tagesende
+    Column("work_cntr", String(20), primary_key=True),  # Arbeitsplatz B, vor dem die Ware wartet
+    Column("anzahl_puffer", Integer, nullable=False),
+    Column("menge", Float, nullable=False),
+    Column("aktualisiert_am", TS, nullable=False),
+)
+
+bestand_status = Table(
+    "bestand_status",
+    metadata,
+    Column("id", SmallInteger, primary_key=True, autoincrement=False),
+    Column("letzter_lauf", TS),
+    Column("letzter_erfolg", TS),
+    Column("backfill_ab", TS),       # Beginn des nachgeladenen Zeitfensters (UTC)
+    Column("rueck_wz", TS),          # bis hierhin wurden pps_rueckmeldung-Zeilen ausgewertet
+    Column("event_wz", Integer),     # max. transport_event.id, die verbucht ist
+    Column("meldung", Unicode(1000)),
 )
 
 poller_status = Table(

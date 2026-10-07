@@ -65,9 +65,26 @@ def run_once(settings: Settings, proxia_engine, sce_engine) -> dict:
     return stat
 
 
+def run_bestand(settings: Settings, proxia_engine, sce_engine) -> dict | None:
+    """Bestandsmonitor-Lauf. Fehler hier duerfen die Transporte nie aufhalten."""
+    from . import bestand_lauf
+    try:
+        return bestand_lauf.lauf(settings, proxia_engine, sce_engine)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Bestand-Lauf fehlgeschlagen")
+        try:
+            with sce_engine.begin() as con:
+                bestand_lauf.setze_status(con, state.utcnow(), False, f"FEHLER: {exc}")
+        except Exception:  # noqa: BLE001
+            log.exception("Bestand-Status konnte nicht geschrieben werden")
+        return None
+
+
 def run_forever(settings: Settings, proxia_engine, sce_engine) -> None:
-    log.info("Starte Poller: alle %ss, Modus=%s, Fallback=%s",
-             settings.poll_sekunden, settings.standard_modus, settings.fallback_regel)
+    log.info("Starte Poller: alle %ss, Modus=%s, Fallback=%s, Bestand=%s (alle %ss, %s Tage)",
+             settings.poll_sekunden, settings.standard_modus, settings.fallback_regel,
+             "an" if settings.bestand_aktiv else "aus", settings.bestand_sekunden, settings.bestand_tage)
+    naechster_bestand = 0.0
     while True:
         t0 = time.monotonic()
         try:
@@ -83,4 +100,9 @@ def run_forever(settings: Settings, proxia_engine, sce_engine) -> None:
                     state.heartbeat(con, state.utcnow(), False, f"FEHLER: {exc}")
             except Exception:  # noqa: BLE001
                 log.exception("Heartbeat konnte nicht geschrieben werden")
+        if settings.bestand_aktiv and time.monotonic() >= naechster_bestand:
+            b = run_bestand(settings, proxia_engine, sce_engine)
+            if b and (b.get("modus") == "erstlauf" or b.get("mengenaenderungen") or b.get("transport_events")):
+                log.info("Bestand: %s", b)
+            naechster_bestand = time.monotonic() + settings.bestand_sekunden
         time.sleep(max(1.0, settings.poll_sekunden - (time.monotonic() - t0)))
