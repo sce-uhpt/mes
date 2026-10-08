@@ -283,7 +283,7 @@ def _nachladen(proxia_engine, orders, fenster_start, jetzt, ap, settings):
         return None
     wt_qty = proxia.fetch_wt_qty(proxia_engine, orders)
     rueck = proxia.fetch_rueck_orders(proxia_engine, orders)
-    kette = B.baue_kette(vorgaenge, ap, settings.fallback_regel)
+    kette = B.baue_kette(vorgaenge, ap, settings.fallback_regel, settings.bestand_transport_ort)
     vb = B.backfill(vorgaenge, wt_qty, rueck, kette, fenster_start, jetzt)
     return vb, kette
 
@@ -330,7 +330,12 @@ def _scope(settings, proxia_engine, jetzt) -> tuple[datetime, set]:
     # Ware, die laenger liegt als das Fenster: offene Auftraege mit Aktivitaet im letzten Jahr
     if settings.bestand_scope_tage > settings.bestand_tage:
         orders |= proxia.fetch_offene_orders(proxia_engine, jetzt - timedelta(days=settings.bestand_scope_tage))
-    return fs, orders
+    return fs, {o for o in orders if not B.ist_ausgeschlossen(o, settings.bestand_ausschluss)}
+
+
+def _ohne_transport(tr: pd.DataFrame, settings) -> pd.DataFrame:
+    """Push ohne Transport-App (MES_BESTAND_TRANSPORT_ORT=0): Transport-Events nicht verbuchen."""
+    return tr if settings.bestand_transport_ort else tr.iloc[0:0]
 
 
 def erstlauf(settings, proxia_engine, sce_engine, jetzt) -> dict:
@@ -339,15 +344,20 @@ def erstlauf(settings, proxia_engine, sce_engine, jetzt) -> dict:
     with sce_engine.connect() as con:
         ap = lade_arbeitsplatz(con)
         ev_wz = max_event_id(con)
-        tr = lade_transport_events(con, None, ev_wz, seit=fs)
+        tr = _ohne_transport(lade_transport_events(con, None, ev_wz, seit=fs), settings)
     erg = _nachladen(proxia_engine, orders, fs, jetzt, ap, settings) if orders else None
-    rows, v, kette, fertig = [], pd.DataFrame(), {}, set()
+    rows, v, kette, fertig, korr = [], pd.DataFrame(), {}, set(), []
     if erg:
         vb, kette = erg
         v = vb.vorgaenge
         ev = vb.ereignisse + B.transport_ereignisse(tr)
         fertig, ab = _abschluss(v, kette, ev)
-        rows = B.wende_an(ev + ab, kette, B.Saldo())
+        saldo = B.Saldo()
+        rows = B.wende_an(ev, kette, saldo)
+        # Regel 1 (Nachfolger fertig -> Rest ausbuchen) zum Zeitpunkt der Fertigmeldung
+        letzte_ts = pd.DataFrame(rows).groupby("von_wt_id")["ts"].max().to_dict() if rows else {}
+        korr = B.abgleich_ereignisse(v, kette, saldo, orders - fertig, jetzt, "init", letzte_ts)
+        rows += B.wende_an(korr + ab, kette, saldo)
 
     tage = [d.date() for d in pd.date_range(
         pd.Timestamp(fs).tz_localize("UTC").tz_convert(B.TZ).date(),
@@ -372,7 +382,9 @@ def erstlauf(settings, proxia_engine, sce_engine, jetzt) -> dict:
         schreibe_tagesbestand(con, tb, tage, jetzt)
         stat = {"modus": "erstlauf", "auftraege": len(orders), "vorgaenge": len(v), "bewegungen": n,
                 "puffer_mit_bestand": int((p["menge_gesamt"] > B.EPS).sum()) if len(p) else 0,
-                "abgeschlossen": len(fertig), "arbeitsplatz_art_gesetzt": n_art}
+                "abgeschlossen": len(fertig), "differenzen": sum(e.art == "differenz" for e in korr),
+                "abgleich_korrekturen": sum(e.art == "abgleich" for e in korr),
+                "arbeitsplatz_art_gesetzt": n_art}
         setze_status(con, jetzt, True, ", ".join(f"{k}={v_}" for k, v_ in stat.items()),
                      backfill_ab=fs, rueck_wz=jetzt, event_wz=ev_wz)
     return stat
@@ -384,7 +396,7 @@ def folgelauf(settings, proxia_engine, sce_engine, jetzt, st) -> dict:
         meld = neue_meldungen(con, st.get("rueck_wz"))
         alt = lade_vorgaenge(con, set(meld["pps_order"].dropna()) if not meld.empty else ())
         ev_bis = max_event_id(con)
-        tr = lade_transport_events(con, st.get("event_wz"), ev_bis)
+        tr = _ohne_transport(lade_transport_events(con, st.get("event_wz"), ev_bis), settings)
         ap = lade_arbeitsplatz(con)
         alle_bekannten = set(pd.read_sql(select(bestand_vorgang.c.pps_order).distinct(), con)["pps_order"])
 
@@ -393,6 +405,7 @@ def folgelauf(settings, proxia_engine, sce_engine, jetzt, st) -> dict:
     neue_orders = set(meld["pps_order"].dropna()) - alle_bekannten if not meld.empty else set()
     if not tr.empty:  # Transporte zu Auftraegen, die der Bestand noch nicht kennt
         neue_orders |= set(tr["pps_order"].dropna()) - alle_bekannten
+    neue_orders = {o for o in neue_orders if not B.ist_ausgeschlossen(o, settings.bestand_ausschluss)}
 
     t_proxia = time.monotonic()
     neu = proxia.fetch_bestand_vorgaenge(proxia_engine, bekannte_orders) if bekannte_orders else pd.DataFrame()
@@ -402,7 +415,7 @@ def folgelauf(settings, proxia_engine, sce_engine, jetzt, st) -> dict:
 
     ereignisse, v_neu, kette = [], pd.DataFrame(), {}
     if not neu.empty:
-        kette = B.baue_kette(neu, ap, settings.fallback_regel)
+        kette = B.baue_kette(neu, ap, settings.fallback_regel, settings.bestand_transport_ort)
         ev, v_neu = B.live_ereignisse(alt, neu, meld, jetzt, lauf_id)
         v_neu["erste_meldung_ts"] = v_neu["wt_id"].map(a["erste_meldung_ts"])
         v_neu["letzte_meldung_ts"] = v_neu["wt_id"].map(a["letzte_meldung_ts"])
@@ -457,7 +470,9 @@ def folgelauf(settings, proxia_engine, sce_engine, jetzt, st) -> dict:
         stat = {"modus": "laufend", "auftraege": len(bekannte_orders), "neue_auftraege": len(neue_orders),
                 "mengenaenderungen": int(len(quellen)),
                 "davon_ohne_rueckmeldung": int((quellen == "erkennung").sum()),
-                "transport_events": len(tr_ev), "abgleich_korrekturen": len(korr) + len(weg),
+                "transport_events": len(tr_ev),
+                "abgleich_korrekturen": sum(e.art == "abgleich" for e in korr) + len(weg),
+                "differenzen": sum(e.art == "differenz" for e in korr),
                 "abgeschlossen": len(fertig), "vorgaenge_geschrieben": n_v,
                 "vorgaenge_entfernt": len(geloescht), "bewegungen": n, "proxia_ms": proxia_ms}
         setze_status(con, jetzt, True, ", ".join(f"{k}={v_}" for k, v_ in stat.items()),

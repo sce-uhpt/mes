@@ -48,8 +48,16 @@ als „gesehen“ gespeichert, dadurch geht bei Fehlern nichts verloren.
 Logik in `bestand.py` (rein, getestet), Ablauf in `bestand_lauf.py`.
 
 - **Puffer** = Übergang Vorgang A → Nachfolger B. Bestand = Gut(A) − Gut(B) − Ausschuss(B).
-- **Ort**: `bereit` (bei A) → `unterwegs` (Fahrer hat übernommen) → `an_b` (erledigt bzw. kein
-  Transport nötig). `auto_erledigt` zählt wie erledigt. B verbraucht zuerst aus `an_b`.
+- **Ort / Push-Prinzip**: Fertig gemeldete Ware liegt vor dem Nachfolger (`an_b`). Solange der
+  Milk Run nicht live ist (`MES_BESTAND_TRANSPORT_ORT=0`, Standard), werden Transport-Events
+  ignoriert. Mit `=1`: bei Übergängen mit Transport `bereit` (bei A) → `unterwegs` (Fahrer hat
+  übernommen) → `an_b` (erledigt). `auto_erledigt` zählt wie erledigt. B verbraucht zuerst aus
+  `an_b`. Nach dem Umschalten `bestand-reset`.
+- **Ausschluss**: Aufträge mit Präfix aus `MES_BESTAND_AUSSCHLUSS_PRAEFIX` (Standard `IH` =
+  Instandhaltung, Soll 0, ohne Arbeitsplatz) kommen nicht in den Bestand.
+- **Regel 1 – Nachfolger fertig**: Ist B fertig gemeldet, ist der Puffer davor leer. Ein Rest
+  (meist nicht gebuchter Ausschuss) wird als `art = differenz` ausgebucht (Erstlauf: zum
+  Zeitpunkt der Fertigmeldung von B). Wird B wieder geöffnet, holt der Abgleich die Menge zurück.
 - **Mengen**: TSF_RUECKMELDUNG hat keine Menge. Gutmengen je Tag/Schicht aus `TSF_WT_QTY`
   (nur `C_GUT`), Summen und Ausschuss aus `TSF_WT`. Rund 40 % der Vorgänge werden außerhalb
   von Proxia (vermutlich SAP) fertig gemeldet — dann erkennt der Poller die Änderung in TSF_WT

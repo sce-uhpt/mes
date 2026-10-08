@@ -27,6 +27,11 @@ class Settings:
     bestand_tage: int = 90
     bestand_scope_tage: int = 365
     pseudo_arbeitsplaetze: frozenset = frozenset({"10000167", "10000168"})
+    # Auftraege mit diesen Praefixen gehoeren nicht in den Bestand (IH = Instandhaltung)
+    bestand_ausschluss: tuple = ("IH",)
+    # 0 = Push ohne Transport-App: fertige Ware liegt sofort vor B, Transport-Events ignorieren.
+    # 1 = ab Go-live Milk Run: bei Uebergaengen mit Transport "bereit beim Vorgaenger" bis zur Quittung.
+    bestand_transport_ort: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -43,6 +48,11 @@ class Settings:
             pseudo_arbeitsplaetze=frozenset(
                 x.strip() for x in os.environ.get("MES_PSEUDO_ARBEITSPLAETZE", "10000167,10000168").split(",")
                 if x.strip()),
+            bestand_ausschluss=tuple(
+                x.strip().upper() for x in os.environ.get("MES_BESTAND_AUSSCHLUSS_PRAEFIX", "IH").split(",")
+                if x.strip()),
+            bestand_transport_ort=os.environ.get("MES_BESTAND_TRANSPORT_ORT", "0").strip().lower()
+            in ("1", "true", "ja"),
         )
         if s.standard_modus not in ("teil", "voll"):
             raise ValueError(f"MES_STANDARD_MODUS muss teil|voll sein, ist {s.standard_modus!r}")

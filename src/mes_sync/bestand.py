@@ -83,8 +83,19 @@ class Glied:
     ort_zugang: str  # 'bereit' (Transport noetig) oder 'an_b'
 
 
+def ist_ausgeschlossen(pps_order, praefixe) -> bool:
+    """Auftraege, die nicht in den Bestand gehoeren (z. B. IH = Instandhaltung, Soll 0, ohne Arbeitsplatz)."""
+    o = str(pps_order or "").strip().upper()
+    return any(o.startswith(p) for p in praefixe)
+
+
 def baue_kette(vorgaenge: pd.DataFrame, arbeitsplatz: pd.DataFrame | None = None,
-               fallback_regel: str = "arbeitsplatz") -> dict[str, Glied]:
+               fallback_regel: str = "arbeitsplatz", transport_ort: bool = True) -> dict[str, Glied]:
+    """Vorgangskette je Auftrag.
+
+    transport_ort=False (Push ohne Transport-App): Zugaenge liegen sofort vor B ('an_b').
+    transport_ort=True: bei Uebergaengen mit Transport erst 'bereit' bis zur Fahrer-Quittung.
+    """
     if vorgaenge.empty:
         return {}
     k = build_kette(vorgaenge)
@@ -103,7 +114,7 @@ def baue_kette(vorgaenge: pd.DataFrame, arbeitsplatz: pd.DataFrame | None = None
             vor=r.vor_wt_id if pd.notna(r.vor_wt_id) else None,
             nach=nach,
             nach_work_cntr=r.nach_work_cntr if pd.notna(r.nach_work_cntr) else None,
-            ort_zugang="bereit" if noetig else "an_b",
+            ort_zugang="bereit" if (noetig and transport_ort) else "an_b",
         )
     return out
 
@@ -113,7 +124,7 @@ def baue_kette(vorgaenge: pd.DataFrame, arbeitsplatz: pd.DataFrame | None = None
 @dataclass
 class Ereignis:
     ts: datetime
-    art: str          # gut | aus | init | uebernommen | zurueckgegeben | erledigt | abgleich | abschluss
+    art: str          # gut | aus | init | uebernommen | zurueckgegeben | erledigt | abgleich | differenz | abschluss
     wt_id: str        # gut/aus: Vorgang mit der Buchung; init/Transport/abschluss: Von-Vorgang A
     menge: float | None
     zeit_quelle: str
@@ -125,7 +136,7 @@ class Ereignis:
     def sortkey(self):
         # Transporte nach Mengenbuchungen gleichen Zeitpunkts
         rang = {"init": 0, "gut": 1, "aus": 2, "uebernommen": 4, "zurueckgegeben": 5,
-                "erledigt": 6, "abgleich": 8, "abschluss": 9}.get(self.art, 7)
+                "erledigt": 6, "abgleich": 8, "differenz": 8, "abschluss": 9}.get(self.art, 7)
         return (pd.Timestamp(self.ts), rang, self.key)
 
 
@@ -170,14 +181,17 @@ def _verbrauch(e: Ereignis, b: Glied, kette, saldo: Saldo, menge: float, art: st
         return [_zeile(e, a, kette, "an_b", -menge, art, "v:an_b")]
     rest = menge
     for ort in ("an_b", "unterwegs", "bereit"):
-        verfuegbar = max(s[ort], 0.0)
-        nimm = min(rest, verfuegbar) if ort != "bereit" else rest
+        nimm = min(rest, max(s[ort], 0.0))
         if nimm > EPS:
             s[ort] -= nimm
             rows.append(_zeile(e, a, kette, ort, -nimm, art, f"v:{ort}"))
             rest -= nimm
         if rest <= EPS:
             break
+    if rest > EPS:  # B verbraucht mehr als bekannt: Fehlmenge dort, wo der Zugang landen wird
+        ort = a.ort_zugang
+        s[ort] -= rest
+        rows.append(_zeile(e, a, kette, ort, -rest, art, f"v:{ort}:f"))
     return rows
 
 
@@ -221,8 +235,8 @@ def wende_an(ereignisse: list[Ereignis], kette: dict[str, Glied], saldo: Saldo) 
             if g.nach:  # Ausgang des letzten Vorgangs verfolgen wir nicht (Versand/Lager)
                 rows += _zugang(e, g, kette, saldo, m, "zugang")
 
-        elif e.art == "abgleich" and m and g.nach:
-            rows += _zugang(e, g, kette, saldo, m, "abgleich")
+        elif e.art in ("abgleich", "differenz") and m and g.nach:
+            rows += _zugang(e, g, kette, saldo, m, e.art)
 
         elif e.art == "aus" and m:
             rows += _verbrauch(e, g, kette, saldo, m, "ausschuss")
@@ -593,22 +607,53 @@ def live_ereignisse(alt: pd.DataFrame, neu: pd.DataFrame, neue_meldungen: pd.Dat
     return ereignisse, out
 
 
+DIFFERENZ_REST = "Differenz bei Fertigmeldung Nachfolger: Rest ausgebucht"
+DIFFERENZ_FEHL = "Differenz bei Fertigmeldung Nachfolger: Fehlmenge ausgeglichen"
+
+
+def puffer_soll(v: pd.DataFrame, g: Glied) -> float:
+    """Sollbestand eines Puffers: Gut(A) - Gut(B) - Ausschuss(B).
+
+    Regel 1: Ist B fertig gemeldet, ist der Puffer leer. Ein Rest (A hat mehr geliefert als B
+    verbraucht, z. B. Ausschuss nicht gebucht) wird als Differenz ausgebucht. Wird B wieder
+    geoeffnet, holt der Abgleich die Menge automatisch zurueck.
+    """
+    if v.at[g.nach, "wt_status_id"] == "C_FRTG":
+        return 0.0
+    return float(v.at[g.wt_id, "qty_gut"] or 0) - float(v.at[g.nach, "qty_gut"] or 0) \
+        - float(v.at[g.nach, "qty_aus"] or 0)
+
+
 def abgleich_ereignisse(vorgaenge: pd.DataFrame, kette: dict[str, Glied], saldo: Saldo,
-                        orders: set, jetzt: datetime, lauf_id: str) -> list[Ereignis]:
-    """Soll-Ist-Abgleich je Puffer: Gut(A) - Gut(B) - Ausschuss(B) gegen den Journalstand.
+                        orders: set, jetzt: datetime, lauf_id: str,
+                        letzte_ts: dict | None = None) -> list[Ereignis]:
+    """Soll-Ist-Abgleich je Puffer (puffer_soll) gegen den Journalstand.
 
     Faengt alles ab, was die Einzelereignisse nicht abbilden (neuer oder geaenderter
-    Arbeitsplan, wieder geoeffnete Auftraege, Korrekturen in Proxia). Im Normalfall leer.
+    Arbeitsplan, wieder geoeffnete Auftraege, Korrekturen in Proxia) und bucht Reste
+    nach Fertigmeldung des Nachfolgers aus (art 'differenz').
+    letzte_ts: je Puffer letzte Journalzeit (nur Erstlauf) -> Differenz zum Zeitpunkt der
+    Fertigmeldung von B statt 'jetzt', damit der Tagesverlauf stimmt.
     """
     v = vorgaenge.set_index("wt_id")
     out = []
     for g in kette.values():
         if not g.nach or g.pps_order not in orders or g.wt_id not in v.index or g.nach not in v.index:
             continue
-        soll = float(v.at[g.wt_id, "qty_gut"] or 0) - float(v.at[g.nach, "qty_gut"] or 0) \
-            - float(v.at[g.nach, "qty_aus"] or 0)
+        soll = puffer_soll(v, g)
         ist = saldo.gesamt(g.wt_id)
-        if abs(soll - ist) > 1e-6:
+        if abs(soll - ist) <= 1e-6:
+            continue
+        if v.at[g.nach, "wt_status_id"] == "C_FRTG":
+            ts = jetzt
+            if letzte_ts is not None:
+                kand = [x for x in (v.at[g.nach, "letzte_meldung_ts"] if "letzte_meldung_ts" in v else None,
+                                    letzte_ts.get(g.wt_id)) if x is not None and not pd.isna(x)]
+                ts = max(pd.Timestamp(x) for x in kand) if kand else jetzt
+            out.append(Ereignis(ts=ts, art="differenz", wt_id=g.wt_id, menge=soll - ist,
+                                zeit_quelle="erkennung", key=f"D|{g.wt_id}|{lauf_id}",
+                                info=DIFFERENZ_REST if ist > soll else DIFFERENZ_FEHL))
+        else:
             out.append(Ereignis(ts=jetzt, art="abgleich", wt_id=g.wt_id, menge=soll - ist,
                                 zeit_quelle="erkennung", key=f"K|{g.wt_id}|{lauf_id}",
                                 info="Abgleich mit Proxia (Arbeitsplan oder Menge geaendert)"))

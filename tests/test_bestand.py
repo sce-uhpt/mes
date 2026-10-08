@@ -155,7 +155,9 @@ def test_live_erkennt_aenderung_ohne_rueckmeldung(plan):
 # ── End-to-End ───────────────────────────────────────────────────────────────
 
 SETTINGS = Settings(poll_sekunden=30, standard_modus="teil", fallback_regel="arbeitsplatz",
-                    backfill_stunden=12, ueberlappung_minuten=10, bestand_tage=10)
+                    backfill_stunden=12, ueberlappung_minuten=10, bestand_tage=10,
+                    bestand_transport_ort=True)
+PUSH = replace(SETTINGS, bestand_transport_ort=False)
 
 
 def q(engine, sql):
@@ -164,9 +166,9 @@ def q(engine, sql):
 
 
 def erwartet_vs_ist(proxia, sce):
-    """Bestand je Puffer muss exakt Gut(A) - Gut(B) - Ausschuss(B) aus TSF_WT sein."""
+    """Bestand je Puffer muss exakt Gut(A) - Gut(B) - Ausschuss(B) aus TSF_WT sein (Regel 1: B fertig -> 0)."""
     wt = q(proxia, "SELECT WT_ID wt_id, PPS_ORDER o, AFO_NR afo, QTY_SOLL soll, QTY_CONFIRMED_GUT gut, "
-                   "QTY_CONFIRMED_AUS aus FROM dbo.TSF_WT WHERE WT_DELETED = 0").sort_values(["o", "afo"])
+                   "QTY_CONFIRMED_AUS aus, WT_STATUS_ID st FROM dbo.TSF_WT WHERE WT_DELETED = 0").sort_values(["o", "afo"])
     wt["nach"] = wt.groupby("o")["wt_id"].shift(-1)
     bv = q(sce, "SELECT wt_id, qty_gut, abgeschlossen FROM sce_mes.bestand_vorgang").set_index("wt_id")
     pu = q(sce, "SELECT von_wt_id, menge_gesamt FROM sce_mes.bestand_puffer").set_index("von_wt_id")
@@ -175,7 +177,8 @@ def erwartet_vs_ist(proxia, sce):
     for w, r in info.iterrows():
         if pd.isna(r.nach) or w not in bv.index or bv.at[w, "abgeschlossen"]:
             continue
-        soll = bv.at[w, "qty_gut"] - bv.at[r.nach, "qty_gut"] - (info.at[r.nach, "aus"] or 0)
+        soll = 0.0 if info.at[r.nach, "st"] == "C_FRTG" else \
+            bv.at[w, "qty_gut"] - bv.at[r.nach, "qty_gut"] - (info.at[r.nach, "aus"] or 0)
         ist = pu.at[w, "menge_gesamt"] if w in pu.index else 0.0
         n += 1
         if abs(soll - ist) > 1e-6:
@@ -298,3 +301,83 @@ def test_backfill_ohne_mengenbuchungen(plan):
     vb = B.backfill(v, leer_q, leer_r, k, T0 - timedelta(days=5), T0)
     rows = B.wende_an(vb.ereignisse, k, B.Saldo())
     assert summe(rows, "w10")["bereit"] == 10.0
+
+
+# ── Push-Prinzip, Regel 1, Ausschluss IH ─────────────────────────────────────
+
+def test_push_ware_liegt_sofort_vor_b(plan):
+    k = B.baue_kette(plan, transport_ort=False)
+    assert all(g.ort_zugang == "an_b" for g in k.values())
+    rows = B.wende_an([gut("w10", 5, 0)], k, B.Saldo())
+    assert summe(rows, "w10") == {"bereit": 0.0, "unterwegs": 0.0, "an_b": 5.0}
+
+
+def test_ausschluss_instandhaltung():
+    assert B.ist_ausgeschlossen("IH0004711", ("IH",))
+    assert B.ist_ausgeschlossen(" ih12 ", ("IH",))
+    assert not B.ist_ausgeschlossen("70263028", ("IH",))
+    assert not B.ist_ausgeschlossen(None, ("IH",))
+
+
+def test_regel1_rest_bei_fertigem_nachfolger(plan):
+    v = plan.copy()
+    v["letzte_meldung_ts"] = pd.NaT
+    v.loc[v.wt_id == "w10", ["qty_gut", "wt_status_id"]] = [10, "C_FRTG"]
+    v.loc[v.wt_id == "w20", ["qty_gut", "wt_status_id", "letzte_meldung_ts"]] = \
+        [8, "C_FRTG", T0 + timedelta(hours=5)]
+    k = B.baue_kette(v, transport_ort=False)
+    saldo = B.Saldo()
+    rows = B.wende_an([gut("w10", 10, 0), gut("w20", 8, 60)], k, saldo)
+    assert saldo.gesamt("w10") == 2.0
+    letzte = pd.DataFrame(rows).groupby("von_wt_id")["ts"].max().to_dict()
+    korr = B.abgleich_ereignisse(v, k, saldo, {"A1"}, T0 + timedelta(days=1), "x", letzte)
+    d = [e for e in korr if e.wt_id == "w10"]
+    assert len(d) == 1 and d[0].art == "differenz" and d[0].menge == -2.0
+    assert d[0].ts == T0 + timedelta(hours=5) and d[0].info == B.DIFFERENZ_REST
+    rows += B.wende_an(korr, k, saldo)
+    assert saldo.gesamt("w10") == 0.0
+    assert {r["art"] for r in rows if r["von_wt_id"] == "w10" and r["menge"] < 0} >= {"differenz"}
+    # stabil: zweiter Abgleich bucht nichts
+    assert [e for e in B.abgleich_ereignisse(v, k, saldo, {"A1"}, T0, "y") if e.wt_id == "w10"] == []
+    # B wieder geoeffnet -> Rest kommt per Abgleich zurueck
+    v.loc[v.wt_id == "w20", "wt_status_id"] = "C_TFRTG"
+    z = [e for e in B.abgleich_ereignisse(v, k, saldo, {"A1"}, T0, "z") if e.wt_id == "w10"]
+    assert len(z) == 1 and z[0].art == "abgleich" and z[0].menge == 2.0
+
+
+def test_push_e2e_ignoriert_transporte(umgebung):
+    proxia_file, proxia, sce = umgebung
+    run_once(PUSH, proxia, sce)
+    s = run_bestand(PUSH, proxia, sce)
+    assert s["modus"] == "erstlauf"
+    assert erwartet_vs_ist(proxia, sce)[1] == []
+    assert q(sce, "SELECT COUNT(*) n FROM sce_mes.wip_bewegung WHERE ort <> 'an_b'").n[0] == 0
+    offen = q(sce, "SELECT id FROM sce_mes.transport_auftrag WHERE status='offen' ORDER BY id")
+    assert app(sce, "uebernehmen", int(offen.id[0]))
+    for i in range(6):
+        fake_proxia.tick(str(proxia_file), anzahl=4, seed=500 + i)
+    run_once(PUSH, proxia, sce)
+    s = run_bestand(PUSH, proxia, sce)
+    assert s["transport_events"] == 0
+    assert erwartet_vs_ist(proxia, sce)[1] == []
+    assert q(sce, "SELECT COUNT(*) n FROM sce_mes.wip_bewegung WHERE ort <> 'an_b'").n[0] == 0
+
+
+def test_ih_auftrag_nicht_im_bestand(umgebung):
+    proxia_file, proxia, sce = umgebung
+    jetzt = state.utcnow()
+    with proxia.begin() as con:
+        con.execute(text("INSERT INTO dbo.TSF_WT (WT_ID, PPS_ORDER, AFO_NR, DISPLAYNAME, WT_STATUS_ID, "
+                         "QTY_SOLL, QTY_CONFIRMED_GUT, WT_DELETED, QTY_CONFIRMED_AUS) "
+                         "VALUES ('ih1', 'IH0000815', '0010', 'Wartung Klimaanlagen', 'C_FRTG', 0, 0, 0, 0)"))
+        con.execute(text("INSERT INTO dbo.TSF_RUECKMELDUNG VALUES ('r-ih1', 'ih1', 'pers1', :t, 'C_FRTG', NULL, :d)"),
+                    {"t": jetzt.strftime("%Y-%m-%d %H:%M:%S.000"), "d": jetzt.strftime("%Y-%m-%d 00:00:00.000")})
+    run_once(PUSH, proxia, sce)
+    run_bestand(PUSH, proxia, sce)
+    assert q(sce, "SELECT COUNT(*) n FROM sce_mes.bestand_vorgang WHERE pps_order LIKE 'IH%'").n[0] == 0
+    with proxia.begin() as con:
+        con.execute(text("INSERT INTO dbo.TSF_RUECKMELDUNG VALUES ('r-ih2', 'ih1', 'pers1', :t, 'C_TFRTG', NULL, :d)"),
+                    {"t": jetzt.strftime("%Y-%m-%d %H:%M:%S.500"), "d": jetzt.strftime("%Y-%m-%d 00:00:00.000")})
+    run_once(PUSH, proxia, sce)
+    run_bestand(PUSH, proxia, sce)  # Folgelauf: neue Meldung an IH-Auftrag
+    assert q(sce, "SELECT COUNT(*) n FROM sce_mes.bestand_vorgang WHERE pps_order LIKE 'IH%'").n[0] == 0
