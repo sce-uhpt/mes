@@ -3,12 +3,12 @@
 Poller, der alle 30 s Rückmeldungen aus dem MES **Proxia** liest, daraus
 **Transportaufträge** ableitet und in das SCE-Warehouse (Schema `sce_mes`)
 schreibt. Alle 2 min führt er außerdem den **Bestand an Ware in Arbeit** fort
-(Journal `wip_bewegung`). Die Shiny-Apps `app_transport` und `app_bestand`
+(Journal `wip_bewegung`). Die Shiny-Apps `app_transport` und `app_wip`
 (Repo `shiny`) lesen nur `sce_mes`.
 
 ```
 Proxia (User report, nur lesen) ──► mes_sync (VM, systemd) ──► SCE.sce_mes ◄── app_transport (/transport/)
-                                                                           ◄── app_bestand   (/bestand/)
+                                                                           ◄── app_wip       (/wip_monitor/)
 ```
 
 ## Datenquellen in Proxia
