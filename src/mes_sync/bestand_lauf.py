@@ -74,7 +74,8 @@ def lade_vorgaenge(con: Connection, auch_orders=()) -> pd.DataFrame:
     for o in _chunks(sorted(set(auch_orders))):
         frames.append(pd.read_sql(select(v).where(and_(v.c.pps_order.in_(o), v.c.abgeschlossen == True)), con))  # noqa: E712
     df = pd.concat(frames, ignore_index=True)
-    return _ts(df, "begin_scheduled", "erste_meldung_ts", "letzte_meldung_ts", "aktualisiert_am")
+    return _ts(df, "begin_scheduled", "erste_meldung_ts", "letzte_meldung_ts", "aktualisiert_am",
+               "wunsch_ts", "fa_wunsch_ts")
 
 
 def lade_journal(con: Connection, von_ids) -> pd.DataFrame:
@@ -153,7 +154,8 @@ def _vorgang_records(v: pd.DataFrame, kette: dict, abgeschlossen: set, jetzt) ->
 
 VERGLEICH = ["pps_order", "afo_nr", "wt_status_id", "work_cntr", "vor_wt_id", "nach_wt_id", "qty_soll",
              "qty_gut", "qty_gut_proxia", "qty_aus", "qty_nach", "plausi", "abgeschlossen",
-             "erste_meldung_ts", "letzte_meldung_ts", "begin_scheduled", "plan_res"]
+             "erste_meldung_ts", "letzte_meldung_ts", "begin_scheduled", "plan_res",
+             "wunsch_ts", "fa_wunsch_ts"]
 
 
 def _gleich(a, b) -> bool:

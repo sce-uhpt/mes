@@ -90,6 +90,8 @@ CREATE TABLE sce_mes.bestand_vorgang (
 	plausi NVARCHAR(200) NULL, 
 	abgeschlossen BIT NOT NULL, 
 	aktualisiert_am DATETIME2(3) NOT NULL, 
+	wunsch_ts DATETIME2(3) NULL, 
+	fa_wunsch_ts DATETIME2(3) NULL, 
 	PRIMARY KEY (wt_id)
 );
 GO

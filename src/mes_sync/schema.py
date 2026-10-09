@@ -187,7 +187,7 @@ bestand_vorgang = Table(
     Column("qty_nach", Float),
     Column("einheit", String(20)),
     Column("conf_nr", String(20)),
-    Column("begin_scheduled", TS),
+    Column("begin_scheduled", TS),   # Feinplanung, wird laufend nachgeplant
     Column("material_nr", Unicode(40)),
     Column("material_text", Unicode(400)),
     Column("psp", Unicode(40)),
@@ -196,6 +196,9 @@ bestand_vorgang = Table(
     Column("plausi", Unicode(200)),
     Column("abgeschlossen", Boolean, nullable=False, default=False),
     Column("aktualisiert_am", TS, nullable=False),
+    # angehaengt (ALTER TABLE ueber init-db): stabile Wunschtermine aus Proxia
+    Column("wunsch_ts", TS),         # TSF_WT.DESIRED_DUE_TS (Vorgang)
+    Column("fa_wunsch_ts", TS),      # TSF_FA.DESIRED_DUE_TS (Auftrag, Mitternacht lokal)
     Index("ix_bvorgang_order", "pps_order"),
     Index("ix_bvorgang_wc", "work_cntr"),
 )

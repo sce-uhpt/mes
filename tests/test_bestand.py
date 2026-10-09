@@ -222,6 +222,9 @@ def test_erstlauf_stimmt_mit_proxia_ueberein(umgebung):
     art = q(sce, "SELECT work_cntr, art FROM sce_mes.arbeitsplatz").set_index("work_cntr")["art"]
     assert art.get("10000145") == "extern" and art.get("10000168") == "pseudo"
     assert len(q(sce, "SELECT * FROM sce_mes.bestand_tag")) > 0
+    # Wunschtermine aus Proxia uebernommen (Vorgang teils leer, Auftrag immer gefuellt)
+    w = q(sce, "SELECT COUNT(wunsch_ts) w, COUNT(fa_wunsch_ts) f, COUNT(*) n FROM sce_mes.bestand_vorgang")
+    assert 0 < w.w[0] < w.n[0] and w.f[0] == w.n[0]
     # Vorgaenge ohne Proxia-Rueckmeldung wurden mit geschaetztem Zeitpunkt verbucht
     zq = q(sce, "SELECT DISTINCT zeit_quelle FROM sce_mes.wip_bewegung").zeit_quelle
     assert {"rueckmeldung", "fenster"} <= set(zq) or {"rueckmeldung", "tag"} <= set(zq)

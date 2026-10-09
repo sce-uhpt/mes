@@ -46,14 +46,16 @@ MATERIAL = [
 DDL = """
 CREATE TABLE IF NOT EXISTS dbo.TRS_RES (RES_ID TEXT PRIMARY KEY, DISPLAYNAME TEXT, RES_TYPE_ID TEXT);
 CREATE TABLE IF NOT EXISTS dbo.TSF_PSP_ELEMENT (PSP_ELEMENT_ID TEXT PRIMARY KEY, PSP_ELEMENT_NR TEXT);
-CREATE TABLE IF NOT EXISTS dbo.TSF_FA (FA_ID TEXT PRIMARY KEY, PSP_ELEMENT_ID TEXT, MAT_ID TEXT);
+CREATE TABLE IF NOT EXISTS dbo.TSF_FA (FA_ID TEXT PRIMARY KEY, PSP_ELEMENT_ID TEXT, MAT_ID TEXT,
+    DESIRED_DUE_TS TEXT);
 CREATE TABLE IF NOT EXISTS dbo.TSF_WT (
     WT_ID TEXT PRIMARY KEY, PPS_ORDER TEXT, AFO_NR TEXT, DISPLAYNAME TEXT, WT_STATUS_ID TEXT,
     PPS_WORK_CNTR TEXT, PLANNED_RES_ID TEXT, QTY_SOLL REAL, QTY_CONFIRMED_GUT REAL,
     PPS_ART_NR TEXT, PPS_ART_DISPLAYNAME TEXT, PPS_PLANT TEXT, FA_ID TEXT, WT_DELETED INTEGER,
     QTY_CONFIRMED_AUS REAL DEFAULT 0, QTY_CONFIRMED_NACH REAL DEFAULT 0, UNIT_QTY TEXT,
     CONF_NR TEXT, BEGIN_SCHEDULED TEXT,
-    U_FREIGABE TEXT);  -- nur Simulator: ab wann der Auftrag bearbeitet wird
+    U_FREIGABE TEXT,  -- nur Simulator: ab wann der Auftrag bearbeitet wird
+    DESIRED_DUE_TS TEXT);
 CREATE TABLE IF NOT EXISTS dbo.TSF_WT_QTY (
     WT_QTY_ID TEXT PRIMARY KEY, RES_ID TEXT, WT_ID TEXT, SHIFT_ID TEXT, TIMEFRAME_ID TEXT,
     CAL_DAY TEXT, QTY_CLASS_ID TEXT, QTY REAL);
@@ -115,9 +117,11 @@ def init(path: str, auftraege: int = 40, stunden: float = 6, seed: int = 42) -> 
         psp = f"psp{n % 6}"
         con.execute("INSERT OR IGNORE INTO dbo.TSF_PSP_ELEMENT VALUES (?,?)", (psp, f"P-26{n % 6:03d}-01"))
         mat_nr, mat_txt = rnd.choice(MATERIAL)
-        con.execute("INSERT INTO dbo.TSF_FA VALUES (?,?,?)", (fa, psp, mat_nr))
         soll = rnd.choice([1, 1, 2, 4, 5, 10, 20, 50])
         k = rnd.randint(3, 7)
+        # Wunschtermin Auftrag: Mitternacht lokal, wie in Proxia (UTC gespeichert)
+        fa_wunsch = (freigabe + timedelta(days=2 * k + 4)).replace(hour=22, minute=0, second=0, microsecond=0)
+        con.execute("INSERT INTO dbo.TSF_FA VALUES (?,?,?,?)", (fa, psp, mat_nr, _ts(fa_wunsch)))
         kette = rnd.sample(RESSOURCEN, k)
         if rnd.random() < 0.25:  # gelegentlich zwei Vorgaenge am selben Platz
             kette.insert(1, kette[0])
@@ -128,10 +132,11 @@ def init(path: str, auftraege: int = 40, stunden: float = 6, seed: int = 42) -> 
             conf += 1
             termin = freigabe + timedelta(days=2 * j + 1)
             con.execute(
-                "INSERT INTO dbo.TSF_WT VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,?,?,?,?)",
+                "INSERT INTO dbo.TSF_WT VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,?,?,?,?,?)",
                 (uuid.uuid4().hex, order, afo, rnd.choice(VORGANG_TEXT.get(typ, ["Versand"])), "C_FREI", wc,
                  _res_id(name), soll, 0, mat_nr, mat_txt, "80", fa, einheit, f"00{conf}",
-                 _ts(termin), _ts(freigabe)))
+                 _ts(termin), _ts(freigabe),
+                 None if rnd.random() < 0.15 else _ts(termin - timedelta(hours=rnd.randint(-48, 24)))))
     con.commit()
 
     # Historie: Zeit in Schritten vorspulen und Ereignisse erzeugen

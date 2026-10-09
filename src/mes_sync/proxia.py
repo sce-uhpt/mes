@@ -107,6 +107,7 @@ SQL_BESTAND_VORGAENGE = text("""
            R.DISPLAYNAME AS PLAN_RES, R.RES_TYPE_ID AS PLAN_RES_TYP,
            WT.QTY_SOLL, WT.QTY_CONFIRMED_GUT, WT.QTY_CONFIRMED_AUS, WT.QTY_CONFIRMED_NACH,
            WT.UNIT_QTY, WT.CONF_NR, WT.BEGIN_SCHEDULED,
+           WT.DESIRED_DUE_TS, FA.DESIRED_DUE_TS AS FA_DESIRED_DUE_TS,
            WT.PPS_ART_NR, WT.PPS_ART_DISPLAYNAME, PSP.PSP_ELEMENT_NR
     FROM dbo.TSF_WT AS WT
     LEFT JOIN dbo.TRS_RES AS R ON R.RES_ID = WT.PLANNED_RES_ID
@@ -134,6 +135,8 @@ BESTAND_VORGANG_COLS = {
     **{k: v for k, v in VORGANG_COLS.items() if k not in ("PPS_PLANT",)},
     "QTY_CONFIRMED_AUS": "qty_aus", "QTY_CONFIRMED_NACH": "qty_nach",
     "UNIT_QTY": "einheit", "CONF_NR": "conf_nr", "BEGIN_SCHEDULED": "begin_scheduled",
+    # Wunschtermine bewegen sich nicht mit der Feinplanung (BEGIN_SCHEDULED wird nachgeplant)
+    "DESIRED_DUE_TS": "wunsch_ts", "FA_DESIRED_DUE_TS": "fa_wunsch_ts",
 }
 
 
@@ -169,7 +172,8 @@ def fetch_bestand_vorgaenge(engine: Engine, orders) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     for col in ("einheit", "conf_nr"):
         df[col] = df[col].astype("string").str.strip()
-    df["begin_scheduled"] = pd.to_datetime(df["begin_scheduled"], errors="coerce")
+    for col in ("begin_scheduled", "wunsch_ts", "fa_wunsch_ts"):
+        df[col] = pd.to_datetime(df[col], errors="coerce")
     return df.drop_duplicates("wt_id")
 
 
