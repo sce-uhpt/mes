@@ -83,6 +83,17 @@ class Glied:
     ort_zugang: str  # 'bereit' (Transport noetig) oder 'an_b'
 
 
+def map_ts(keys: pd.Series, werte: pd.Series) -> pd.Series:
+    """keys -> Zeitstempel aus `werte` (Index = Schluessel, eindeutig).
+
+    Ersatz fuer keys.map(werte): pandas 3 bricht ab, wenn `werte` eine LEERE
+    datetime-Series ist ("Cannot cast DatetimeArray to dtype float64").
+    """
+    if werte is None or len(werte) == 0:
+        return pd.Series(pd.NaT, index=keys.index, dtype="datetime64[ns]")
+    return pd.Series(werte.reindex(keys.to_numpy()).to_numpy(), index=keys.index)
+
+
 def ist_ausgeschlossen(pps_order, praefixe) -> bool:
     """Auftraege, die nicht in den Bestand gehoeren (z. B. IH = Instandhaltung, Soll 0, ohne Arbeitsplatz)."""
     o = str(pps_order or "").strip().upper()
@@ -438,8 +449,8 @@ def wirksame_mengen(vorgaenge: pd.DataFrame, wt_qty: pd.DataFrame, rueck: pd.Dat
         r = rueck[rueck["wt_id"].isin(v["wt_id"])]
         erste = r.groupby("wt_id")["rueck_ts"].min()
         letzte = r[r["rueck_type_id"].isin(MELDE_TYPEN)].groupby("wt_id")["rueck_ts"].max()
-        v["erste_meldung_ts"] = v["wt_id"].map(erste)
-        v["letzte_meldung_ts"] = v["wt_id"].map(letzte)
+        v["erste_meldung_ts"] = map_ts(v["wt_id"], erste)
+        v["letzte_meldung_ts"] = map_ts(v["wt_id"], letzte)
     else:
         v["erste_meldung_ts"] = pd.NaT
         v["letzte_meldung_ts"] = pd.NaT

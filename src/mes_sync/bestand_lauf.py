@@ -419,15 +419,15 @@ def folgelauf(settings, proxia_engine, sce_engine, jetzt, st) -> dict:
     if not neu.empty:
         kette = B.baue_kette(neu, ap, settings.fallback_regel, settings.bestand_transport_ort)
         ev, v_neu = B.live_ereignisse(alt, neu, meld, jetzt, lauf_id)
-        v_neu["erste_meldung_ts"] = v_neu["wt_id"].map(a["erste_meldung_ts"])
-        v_neu["letzte_meldung_ts"] = v_neu["wt_id"].map(a["letzte_meldung_ts"])
+        v_neu["erste_meldung_ts"] = B.map_ts(v_neu["wt_id"], a["erste_meldung_ts"] if len(a) else None)
+        v_neu["letzte_meldung_ts"] = B.map_ts(v_neu["wt_id"], a["letzte_meldung_ts"] if len(a) else None)
         if not meld.empty:
             m = meld[meld["wt_id"].isin(v_neu["wt_id"])]
             erste = m.groupby("wt_id")["rueck_ts"].min()
             letzte = m[m["rueck_type_id"].isin(B.MELDE_TYPEN)].groupby("wt_id")["rueck_ts"].max()
-            v_neu["erste_meldung_ts"] = v_neu["erste_meldung_ts"].fillna(v_neu["wt_id"].map(erste))
+            v_neu["erste_meldung_ts"] = v_neu["erste_meldung_ts"].fillna(B.map_ts(v_neu["wt_id"], erste))
             v_neu["letzte_meldung_ts"] = pd.concat(
-                [v_neu["letzte_meldung_ts"], v_neu["wt_id"].map(letzte)], axis=1).max(axis=1)
+                [v_neu["letzte_meldung_ts"], B.map_ts(v_neu["wt_id"], letzte)], axis=1).max(axis=1)
         ereignisse += ev
     if nachgeladen:
         vb, k2 = nachgeladen

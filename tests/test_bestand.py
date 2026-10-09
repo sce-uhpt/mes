@@ -384,3 +384,15 @@ def test_ih_auftrag_nicht_im_bestand(umgebung):
     run_once(PUSH, proxia, sce)
     run_bestand(PUSH, proxia, sce)  # Folgelauf: neue Meldung an IH-Auftrag
     assert q(sce, "SELECT COUNT(*) n FROM sce_mes.bestand_vorgang WHERE pps_order LIKE 'IH%'").n[0] == 0
+
+
+def test_nur_startmeldungen_kein_absturz(plan):
+    """pandas 3: Mappen mit leerer datetime-Series brach ab (09.10., Auftrag nur mit C_START)."""
+    leer_q = pd.DataFrame(columns=["wt_id", "cal_day", "shift_id", "qty"])
+    rueck = pd.DataFrame({"rueck_id": ["r1"], "wt_id": ["w10"], "rueck_ts": [pd.Timestamp(T0)],
+                          "rueck_type_id": ["C_START"]})
+    v = B.wirksame_mengen(plan, leer_q, rueck)
+    assert v["letzte_meldung_ts"].isna().all()
+    assert v.set_index("wt_id").at["w10", "erste_meldung_ts"] == pd.Timestamp(T0)
+    leer = pd.Series([], dtype="datetime64[ns]", index=pd.Index([], dtype=object))
+    assert B.map_ts(plan["wt_id"], leer).isna().all()
