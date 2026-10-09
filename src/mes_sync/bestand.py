@@ -458,11 +458,13 @@ def wirksame_mengen(vorgaenge: pd.DataFrame, wt_qty: pd.DataFrame, rueck: pd.Dat
 
 
 def backfill(vorgaenge: pd.DataFrame, wt_qty: pd.DataFrame, rueck: pd.DataFrame,
-             kette: dict[str, Glied], fenster_start: datetime, jetzt: datetime) -> Vorbereitung:
-    """Ereignisse fuer das Zeitfenster [fenster_start, jetzt] plus Anfangsbestand.
+             kette: dict[str, Glied], fenster_start: datetime, jetzt: datetime,
+             verdichten: bool = True) -> Vorbereitung:
+    """Ereignisse der geladenen Auftraege; Summe = heutiger Stand in TSF_WT.
 
-    Die Summe aller Ereignisse entspricht exakt dem heutigen Stand in TSF_WT;
-    was vor dem Fenster passiert ist, steckt im Anfangsbestand (init).
+    verdichten=True: was vor fenster_start passiert ist, wird zu einem Anfangsbestand (init)
+    je Puffer zusammengefasst. verdichten=False: komplette Historie als Einzelbuchungen.
+    Ereignisse ohne bekannten Zeitpunkt liegen in beiden Faellen auf fenster_start.
     """
     v = wirksame_mengen(vorgaenge, wt_qty, rueck)
     info = v.set_index("wt_id")
@@ -531,6 +533,9 @@ def backfill(vorgaenge: pd.DataFrame, wt_qty: pd.DataFrame, rueck: pd.DataFrame,
             ts, quelle = zeitpunkt(wt)
             ereignisse.append(Ereignis(ts=ts if ts is not None else fs, art="aus", wt_id=wt, menge=aus,
                                        zeit_quelle=quelle, key=f"B|A|{wt}"))
+
+    if not verdichten:
+        return Vorbereitung(ereignisse, v)
 
     # 3) Alles vor dem Fenster zu einem Anfangsbestand je Puffer und Ort verdichten.
     #    Zeitpunkt = letzte Gutbuchung an A vor dem Fenster (fuer "liegt seit"), sonst Fensterbeginn.

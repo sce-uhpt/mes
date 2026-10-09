@@ -64,7 +64,9 @@ Logik in `bestand.py` (rein, getestet), Ablauf in `bestand_lauf.py`.
   und nimmt den Erkennungszeitpunkt (`zeit_quelle = erkennung`).
 - **Erster Lauf** (`bestand_status.backfill_ab` leer): Aufträge mit Proxia-Aktivität in den
   letzten `MES_BESTAND_TAGE` Tagen plus offene Aufträge mit Aktivität in `MES_BESTAND_SCOPE_TAGE`
-  nachladen. Was vor dem Fenster passiert ist, wird zum Anfangsbestand (`init`).
+  nachladen. Mit `MES_BESTAND_JOURNAL_VOLL=1` (Standard) kommt die komplette Historie dieser
+  Aufträge als Einzelbuchungen ins Journal; mit `0` wird alles vor dem Fenster zu einem
+  Anfangsbestand (`init`) verdichtet. Der Tagesverlauf (`bestand_tag`) beginnt immer beim Fenster.
 - **Jeder Lauf** gleicht danach je Puffer Soll (TSF_WT) gegen Journal ab (`abgleich`) — fängt
   geänderte Arbeitspläne, gelöschte Vorgänge und Korrekturen ab. Normalfall: 0 Korrekturen.
 - **Abschluss**: Ist der letzte Vorgang fertig, wird der Restbestand ausgebucht.

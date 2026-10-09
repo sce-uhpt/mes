@@ -32,6 +32,9 @@ class Settings:
     # 0 = Push ohne Transport-App: fertige Ware liegt sofort vor B, Transport-Events ignorieren.
     # 1 = ab Go-live Milk Run: bei Uebergaengen mit Transport "bereit beim Vorgaenger" bis zur Quittung.
     bestand_transport_ort: bool = False
+    # 1 = komplette Historie der Auftraege im Journal (Suche zeigt alle Bewegungen),
+    # 0 = alles vor MES_BESTAND_TAGE zu einem Anfangsbestand verdichten
+    bestand_journal_voll: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -52,6 +55,8 @@ class Settings:
                 x.strip().upper() for x in os.environ.get("MES_BESTAND_AUSSCHLUSS_PRAEFIX", "IH").split(",")
                 if x.strip()),
             bestand_transport_ort=os.environ.get("MES_BESTAND_TRANSPORT_ORT", "0").strip().lower()
+            in ("1", "true", "ja"),
+            bestand_journal_voll=os.environ.get("MES_BESTAND_JOURNAL_VOLL", "1").strip().lower()
             in ("1", "true", "ja"),
         )
         if s.standard_modus not in ("teil", "voll"):

@@ -286,7 +286,8 @@ def _nachladen(proxia_engine, orders, fenster_start, jetzt, ap, settings):
     wt_qty = proxia.fetch_wt_qty(proxia_engine, orders)
     rueck = proxia.fetch_rueck_orders(proxia_engine, orders)
     kette = B.baue_kette(vorgaenge, ap, settings.fallback_regel, settings.bestand_transport_ort)
-    vb = B.backfill(vorgaenge, wt_qty, rueck, kette, fenster_start, jetzt)
+    vb = B.backfill(vorgaenge, wt_qty, rueck, kette, fenster_start, jetzt,
+                    verdichten=not settings.bestand_journal_voll)
     return vb, kette
 
 

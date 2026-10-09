@@ -396,3 +396,17 @@ def test_nur_startmeldungen_kein_absturz(plan):
     assert v.set_index("wt_id").at["w10", "erste_meldung_ts"] == pd.Timestamp(T0)
     leer = pd.Series([], dtype="datetime64[ns]", index=pd.Index([], dtype=object))
     assert B.map_ts(plan["wt_id"], leer).isna().all()
+
+
+def test_journal_voll_und_verdichtet(umgebung):
+    """Volle Historie: keine init-Zeilen, gleicher Bestand wie verdichtet."""
+    _, proxia, sce = umgebung
+    run_once(SETTINGS, proxia, sce)
+    voll = run_bestand(replace(SETTINGS, bestand_journal_voll=True), proxia, sce)
+    n_init = q(sce, "SELECT COUNT(*) n FROM sce_mes.wip_bewegung WHERE art = 'init'").n[0]
+    assert n_init == 0 and erwartet_vs_ist(proxia, sce)[1] == []
+    bestand_lauf.zuruecksetzen(sce)
+    kurz = run_bestand(replace(SETTINGS, bestand_journal_voll=False), proxia, sce)
+    assert q(sce, "SELECT COUNT(*) n FROM sce_mes.wip_bewegung WHERE art = 'init'").n[0] > 0
+    assert erwartet_vs_ist(proxia, sce)[1] == []
+    assert voll["bewegungen"] > kurz["bewegungen"]
